@@ -114,11 +114,10 @@ def save_mask_data(output_path, mask_list, box_list, label_list):
     for mask in mask_list:
         mask_img[mask.cpu().numpy()[0] == True] = 1  # Mark object regions as 1 (white)
     
-    plt.figure(figsize=(10, 10))
-    plt.imshow(mask_img.numpy(), cmap='binary_r')
-    plt.axis('off')
-    plt.savefig(output_path, bbox_inches="tight", dpi=300, pad_inches=0.0)
-    plt.close()
+    # Convert mask to uint8 numpy array (0-255 range)
+    mask_array = (mask_img.numpy() * 255).astype(np.uint8)
+    # Save image directly using cv2 to maintain original dimensions
+    cv2.imwrite(output_path, mask_array)
 
 
 if __name__ == "__main__":
@@ -192,6 +191,7 @@ if __name__ == "__main__":
         if len(boxes_filt) == 0:
             print(f"No objects detected in {img}")
             h, w = image_pil.size[1], image_pil.size[0]
+            print(h, w)
             mask_img = torch.zeros((1, 1, h, w), dtype=torch.bool)  # init to black image
             output_path = os.path.join(output_dir, img)
             save_mask_data(output_path, mask_img, boxes_filt, pred_phrases)
