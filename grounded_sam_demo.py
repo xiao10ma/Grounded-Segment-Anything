@@ -108,33 +108,17 @@ def show_box(box, ax, label):
     ax.text(x0, y0, label)
 
 
-def save_mask_data(output_dir, mask_list, box_list, label_list):
-    value = 0  # 0 for background
-
-    mask_img = torch.zeros(mask_list.shape[-2:])
-    for idx, mask in enumerate(mask_list):
-        mask_img[mask.cpu().numpy()[0] == True] = value + idx + 1
+def save_mask_data(output_path, mask_list, box_list, label_list):
+    # Create binary mask image
+    mask_img = torch.zeros(mask_list.shape[-2:])  # Initialize with zeros (black background)
+    for mask in mask_list:
+        mask_img[mask.cpu().numpy()[0] == True] = 1  # Mark object regions as 1 (white)
+    
     plt.figure(figsize=(10, 10))
-    plt.imshow(mask_img.numpy())
+    plt.imshow(mask_img.numpy(), cmap='binary_r')
     plt.axis('off')
-    plt.savefig(os.path.join(output_dir, 'mask.jpg'), bbox_inches="tight", dpi=300, pad_inches=0.0)
-
-    json_data = [{
-        'value': value,
-        'label': 'background'
-    }]
-    for label, box in zip(label_list, box_list):
-        value += 1
-        name, logit = label.split('(')
-        logit = logit[:-1] # the last is ')'
-        json_data.append({
-            'value': value,
-            'label': name,
-            'logit': float(logit),
-            'box': box.numpy().tolist(),
-        })
-    with open(os.path.join(output_dir, 'mask.json'), 'w') as f:
-        json.dump(json_data, f)
+    plt.savefig(output_path, bbox_inches="tight", dpi=300, pad_inches=0.0)
+    plt.close()
 
 
 if __name__ == "__main__":
@@ -156,7 +140,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--use_sam_hq", action="store_true", help="using sam-hq for prediction"
     )
-    parser.add_argument("--input_image", type=str, required=True, help="path to image file")
+    parser.add_argument("--input_image", type=str, required=False, help="path to image file")
     parser.add_argument("--text_prompt", type=str, required=True, help="text prompt")
     parser.add_argument(
         "--output_dir", "-o", type=str, default="outputs", required=True, help="output directory"
@@ -167,6 +151,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--device", type=str, default="cpu", help="running on cpu only!, default=False")
     parser.add_argument("--bert_base_uncased_path", type=str, required=False, help="bert_base_uncased model path, default=False")
+    parser.add_argument("--image_dir", type=str, required=True, help="path to image directory")
     args = parser.parse_args()
 
     # cfg
@@ -176,67 +161,61 @@ if __name__ == "__main__":
     sam_checkpoint = args.sam_checkpoint
     sam_hq_checkpoint = args.sam_hq_checkpoint
     use_sam_hq = args.use_sam_hq
-    image_path = args.input_image
+    image_dir = args.image_dir
     text_prompt = args.text_prompt
     output_dir = args.output_dir
+    # make dir
+    os.makedirs(output_dir, exist_ok=True)
     box_threshold = args.box_threshold
     text_threshold = args.text_threshold
     device = args.device
     bert_base_uncased_path = args.bert_base_uncased_path
-
-    # make dir
-    os.makedirs(output_dir, exist_ok=True)
-    # load image
-    image_pil, image = load_image(image_path)
     # load model
     model = load_model(config_file, grounded_checkpoint, bert_base_uncased_path, device=device)
-
-    # visualize raw image
-    image_pil.save(os.path.join(output_dir, "raw_image.jpg"))
-
-    # run grounding dino model
-    boxes_filt, pred_phrases = get_grounding_output(
-        model, image, text_prompt, box_threshold, text_threshold, device=device
-    )
-
     # initialize SAM
     if use_sam_hq:
         predictor = SamPredictor(sam_hq_model_registry[sam_version](checkpoint=sam_hq_checkpoint).to(device))
     else:
         predictor = SamPredictor(sam_model_registry[sam_version](checkpoint=sam_checkpoint).to(device))
-    image = cv2.imread(image_path)
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    predictor.set_image(image)
+    for img in os.listdir(image_dir):
+        image_path = os.path.join(image_dir, img)
+        print(image_path)
+        # load image
+        image_pil, image = load_image(image_path)
 
-    size = image_pil.size
-    H, W = size[1], size[0]
-    for i in range(boxes_filt.size(0)):
-        boxes_filt[i] = boxes_filt[i] * torch.Tensor([W, H, W, H])
-        boxes_filt[i][:2] -= boxes_filt[i][2:] / 2
-        boxes_filt[i][2:] += boxes_filt[i][:2]
+        # run grounding dino model
+        boxes_filt, pred_phrases = get_grounding_output(
+            model, image, text_prompt, box_threshold, text_threshold, device=device
+        )
 
-    boxes_filt = boxes_filt.cpu()
-    transformed_boxes = predictor.transform.apply_boxes_torch(boxes_filt, image.shape[:2]).to(device)
+        # If no objects are detected, save a black image and continue to the next image
+        if len(boxes_filt) == 0:
+            print(f"No objects detected in {img}")
+            h, w = image_pil.size[1], image_pil.size[0]
+            mask_img = torch.zeros((1, 1, h, w), dtype=torch.bool)  # init to black image
+            output_path = os.path.join(output_dir, img)
+            save_mask_data(output_path, mask_img, boxes_filt, pred_phrases)
+            continue
 
-    masks, _, _ = predictor.predict_torch(
-        point_coords = None,
-        point_labels = None,
-        boxes = transformed_boxes.to(device),
-        multimask_output = False,
-    )
+        image = cv2.imread(image_path)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        predictor.set_image(image)
 
-    # draw output image
-    plt.figure(figsize=(10, 10))
-    plt.imshow(image)
-    for mask in masks:
-        show_mask(mask.cpu().numpy(), plt.gca(), random_color=True)
-    for box, label in zip(boxes_filt, pred_phrases):
-        show_box(box.numpy(), plt.gca(), label)
+        size = image_pil.size
+        H, W = size[1], size[0]
+        for i in range(boxes_filt.size(0)):
+            boxes_filt[i] = boxes_filt[i] * torch.Tensor([W, H, W, H])
+            boxes_filt[i][:2] -= boxes_filt[i][2:] / 2
+            boxes_filt[i][2:] += boxes_filt[i][:2]
 
-    plt.axis('off')
-    plt.savefig(
-        os.path.join(output_dir, "grounded_sam_output.jpg"),
-        bbox_inches="tight", dpi=300, pad_inches=0.0
-    )
+        boxes_filt = boxes_filt.cpu()
+        transformed_boxes = predictor.transform.apply_boxes_torch(boxes_filt, image.shape[:2]).to(device)
 
-    save_mask_data(output_dir, masks, boxes_filt, pred_phrases)
+        masks, _, _ = predictor.predict_torch(
+            point_coords = None,
+            point_labels = None,
+            boxes = transformed_boxes.to(device),
+            multimask_output = False,
+        )
+        output_path = os.path.join(output_dir, img)
+        save_mask_data(output_path, masks, boxes_filt, pred_phrases)
