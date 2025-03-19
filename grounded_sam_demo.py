@@ -1,6 +1,9 @@
 import argparse
 import os
 import sys
+import concurrent.futures
+import threading
+import glob
 
 import numpy as np
 import json
@@ -28,6 +31,8 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 
+# 添加全局线程锁
+gpu_lock = threading.Lock()
 
 def load_image(image_path):
     # load image
@@ -108,16 +113,125 @@ def show_box(box, ax, label):
     ax.text(x0, y0, label)
 
 
-def save_mask_data(output_path, mask_list, box_list, label_list):
-    # Create binary mask image
-    mask_img = torch.zeros(mask_list.shape[-2:])  # Initialize with zeros (black background)
-    for mask in mask_list:
-        mask_img[mask.cpu().numpy()[0] == True] = 1  # Mark object regions as 1 (white)
+def save_mask_data_merge(output_dir, mask_list, box_list, label_list):
+    # Function for merging masks with existing ones
+    # Load original mask
+    ori_mask_path = os.path.splitext(output_dir)[0] + '.npy'
+    ori_mask = np.load(ori_mask_path)
+    value = ori_mask.max()
     
-    # Convert mask to uint8 numpy array (0-255 range)
-    mask_array = (mask_img.numpy() * 255).astype(np.uint8)
-    # Save image directly using cv2 to maintain original dimensions
-    cv2.imwrite(output_path, mask_array)
+    for idx, mask in enumerate(mask_list):
+        # Convert mask to numpy array
+        mask_np = mask.cpu().numpy()[0]
+        
+        # Check if mask area already has values in original mask
+        overlap_region = ori_mask[mask_np]
+        non_zero_pixels = np.sum(overlap_region > 0)
+        
+        # Calculate total mask pixels
+        mask_pixels = np.sum(mask_np)
+        
+        # Skip if >90% overlap with existing mask
+        if non_zero_pixels > 0 and non_zero_pixels > 0.9 * mask_pixels:
+            continue
+            
+        # Update original mask
+        ori_mask[mask_np] = value + idx + 1
+    
+    # Save numeric mask
+    mask_save_path = os.path.splitext(output_dir)[0] + '.npy'
+    np.save(mask_save_path, ori_mask)
+    
+    # Save visualization image
+    plt.figure(figsize=(10, 10))
+    plt.imshow(ori_mask)
+    plt.axis('off')
+    plt.savefig(output_dir, bbox_inches="tight", dpi=300, pad_inches=0.0)
+    plt.close()
+
+def save_mask_data_overwrite(output_dir, mask_list, box_list, label_list):
+    # Function for overwriting masks
+    value = 0  # 0 for background
+
+    mask_img = torch.zeros(mask_list.shape[-2:], dtype=torch.int32)
+
+    for idx, mask in enumerate(mask_list):
+        mask_img[mask.cpu().numpy()[0] == True] = value + idx + 1
+    
+    # Save numeric mask
+    mask_save_path = os.path.splitext(output_dir)[0] + '.npy'
+    np.save(mask_save_path, mask_img)
+    
+    # Save visualization image
+    plt.figure(figsize=(10, 10))
+    plt.imshow(mask_img)
+    plt.axis('off')
+    plt.savefig(output_dir, bbox_inches="tight", dpi=300, pad_inches=0.0)
+    plt.close()
+
+def save_mask_data(output_dir, mask_list, box_list, label_list):
+    # Auto-select function based on file existence
+    mask_save_path = os.path.splitext(output_dir)[0] + '.npy'
+    
+    if os.path.exists(mask_save_path):
+        # Use merge mode if file exists
+        save_mask_data_merge(output_dir, mask_list, box_list, label_list)
+    else:
+        # Use overwrite mode if file doesn't exist
+        save_mask_data_overwrite(output_dir, mask_list, box_list, label_list)
+
+def process_single_image(args, model, predictor, image_path):
+    try:
+        img = os.path.basename(image_path)
+        if image_path[-4] == '3' or image_path[-4] == '4':
+            return
+        print(f"Processing {image_path}")
+        # load image
+        image_pil, image = load_image(image_path)
+
+        # 使用线程锁保护GPU操作
+        with gpu_lock:
+            # run grounding dino model
+            boxes_filt, pred_phrases = get_grounding_output(
+                model, image, args.text_prompt, args.box_threshold, args.text_threshold, device=args.device
+            )
+
+            # If no objects are detected, save a black image and continue to the next image
+            if len(boxes_filt) == 0:
+                print(f"No objects detected in {img}")
+                h, w = image_pil.size[1], image_pil.size[0]
+                print(h, w)
+                mask_img = torch.zeros((1, 1, h, w), dtype=torch.bool)  # init to black image
+                output_path = os.path.join(args.output_dir, img)
+                save_mask_data(output_path, mask_img, boxes_filt, pred_phrases)
+                return
+
+            image = cv2.imread(image_path)
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            predictor.set_image(image)
+
+            size = image_pil.size
+            H, W = size[1], size[0]
+            for i in range(boxes_filt.size(0)):
+                boxes_filt[i] = boxes_filt[i] * torch.Tensor([W, H, W, H])
+                boxes_filt[i][:2] -= boxes_filt[i][2:] / 2
+                boxes_filt[i][2:] += boxes_filt[i][:2]
+
+            boxes_filt = boxes_filt.cpu()
+            transformed_boxes = predictor.transform.apply_boxes_torch(boxes_filt, image.shape[:2]).to(args.device)
+
+            masks, _, _ = predictor.predict_torch(
+                point_coords = None,
+                point_labels = None,
+                boxes = transformed_boxes.to(args.device),
+                multimask_output = False,
+            )
+            
+            output_path = os.path.join(args.output_dir, img)
+            save_mask_data(output_path, masks, boxes_filt, pred_phrases)
+            
+    except Exception as e:
+        print(f"Error processing {image_path}: {str(e)}")
 
 
 if __name__ == "__main__":
@@ -151,6 +265,7 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cpu", help="running on cpu only!, default=False")
     parser.add_argument("--bert_base_uncased_path", type=str, required=False, help="bert_base_uncased model path, default=False")
     parser.add_argument("--image_dir", type=str, required=True, help="path to image directory")
+    parser.add_argument("--file_pattern", type=str, default="*", help="File name pattern, e.g. '*_0.png'")
     args = parser.parse_args()
 
     # cfg
@@ -176,46 +291,25 @@ if __name__ == "__main__":
         predictor = SamPredictor(sam_hq_model_registry[sam_version](checkpoint=sam_hq_checkpoint).to(device))
     else:
         predictor = SamPredictor(sam_model_registry[sam_version](checkpoint=sam_checkpoint).to(device))
-    for img in os.listdir(image_dir):
-        image_path = os.path.join(image_dir, img)
-        print(image_path)
-        # load image
-        image_pil, image = load_image(image_path)
 
-        # run grounding dino model
-        boxes_filt, pred_phrases = get_grounding_output(
-            model, image, text_prompt, box_threshold, text_threshold, device=device
-        )
+    # 修改图像文件列表筛选逻辑，使用glob模块进行模式匹配
+    pattern_path = os.path.join(image_dir, args.file_pattern)
+    image_files = glob.glob(pattern_path)
+    
+    print(f"找到{len(image_files)}个匹配的图像文件: {args.file_pattern}")
 
-        # If no objects are detected, save a black image and continue to the next image
-        if len(boxes_filt) == 0:
-            print(f"No objects detected in {img}")
-            h, w = image_pil.size[1], image_pil.size[0]
-            print(h, w)
-            mask_img = torch.zeros((1, 1, h, w), dtype=torch.bool)  # init to black image
-            output_path = os.path.join(output_dir, img)
-            save_mask_data(output_path, mask_img, boxes_filt, pred_phrases)
-            continue
+    # Use ThreadPoolExecutor for parallel processing
+    # 减少并发线程数量，避免资源竞争
+    max_workers = min(4, os.cpu_count(), len(image_files))  # 限制最大线程数为4
+    print(f"Processing {len(image_files)} images with {max_workers} workers")
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(process_single_image, args, model, predictor, image_path)
+            for image_path in image_files
+        ]
+        # 等待所有任务完成
+        concurrent.futures.wait(futures)
 
-        image = cv2.imread(image_path)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        predictor.set_image(image)
+    print("All images processed successfully!")
 
-        size = image_pil.size
-        H, W = size[1], size[0]
-        for i in range(boxes_filt.size(0)):
-            boxes_filt[i] = boxes_filt[i] * torch.Tensor([W, H, W, H])
-            boxes_filt[i][:2] -= boxes_filt[i][2:] / 2
-            boxes_filt[i][2:] += boxes_filt[i][:2]
-
-        boxes_filt = boxes_filt.cpu()
-        transformed_boxes = predictor.transform.apply_boxes_torch(boxes_filt, image.shape[:2]).to(device)
-
-        masks, _, _ = predictor.predict_torch(
-            point_coords = None,
-            point_labels = None,
-            boxes = transformed_boxes.to(device),
-            multimask_output = False,
-        )
-        output_path = os.path.join(output_dir, img)
-        save_mask_data(output_path, masks, boxes_filt, pred_phrases)
