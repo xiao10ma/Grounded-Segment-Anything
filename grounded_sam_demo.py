@@ -153,7 +153,7 @@ def save_mask_data_overwrite(output_dir, mask_list, box_list, label_list):
     # Function for overwriting masks
     value = 0  # 0 for background
 
-    mask_img = torch.zeros(mask_list.shape[-2:], dtype=torch.int32)
+    mask_img = torch.zeros(mask_list.shape[-2:], dtype=torch.uint8)
 
     for idx, mask in enumerate(mask_list):
         mask_img[mask.cpu().numpy()[0] == True] = value + idx + 1
